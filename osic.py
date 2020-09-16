@@ -189,7 +189,9 @@ def get_scan_count_median():
 
 #data generator to get train/test batches
 class DataGenerator(Sequence):
-    def __init__(self,original_dim, path, is_train,sex_cat_encoder,smoking_status_cat_encoder):
+    def __init__(self, original_dim, path, is_train, sex_cat_encoder, smoking_status_cat_encoder, use_cache=True):
+        self.image_cache = {}
+        self.use_cache = use_cache
         self.path = path
         if is_train:
             self.dataset = pd.read_csv(path+'\\train.csv')
@@ -231,14 +233,7 @@ class DataGenerator(Sequence):
         tab_data = np.concatenate([sex_np, smoking_np, weeks, age, percent],axis=1)
         return tab_data
 
-    def __getitem__(self,idx):
-        while self.patients[self.idx] in bad_ids:
-            self.idx += 1
-            if self.idx == len(self.patients):
-                self.idx = 0
-        patient_id = self.patients[self.idx]
-        dirname = os.path.join(self.path, patient_id)
-        #prepare image data
+    def _prepare_image_data(self, dirname):
         patient,metadata = load_scan(dirname)
         patient = crop_bounding_box(patient)
         imgs = get_pixels_hu(patient,metadata)
@@ -246,6 +241,23 @@ class DataGenerator(Sequence):
         imgs_after_resamp = resize(imgs,self.image_shape,anti_aliasing = True)
         imgs_after_resamp = make_lungmask(imgs_after_resamp)
         imgs_after_resamp = normalize_and_center_image(imgs_after_resamp)
+        return imgs_after_resamp
+
+    def __getitem__(self,idx):
+        while self.patients[self.idx] in bad_ids:
+            self.idx += 1
+            if self.idx == len(self.patients):
+                self.idx = 0
+        patient_id = self.patients[self.idx]
+        dirname = os.path.join(self.path, patient_id)
+        if self.use_cache and patient_id in self.image_cache:
+            imgs_data = self.image_cache[patient_id]
+        else:
+            #prepare image data
+            imgs_data = self._prepare_image_data(dirname)
+            if self.use_cache:
+                self.image_cache[patient_id] = imgs_data
+
         #prepare tabular data
         tab_data = self._get_tab_data(patient_id)
         if self.is_train:
@@ -255,7 +267,7 @@ class DataGenerator(Sequence):
         self.idx = self.idx + 1
         if self.idx == len(self.patients):
             self.idx = 0
-        return imgs_after_resamp.reshape((imgs_after_resamp.shape[0],imgs_after_resamp.shape[1],imgs_after_resamp.shape[2],1)), tab_data, y
+        return imgs_data.reshape((imgs_data.shape[0],imgs_data.shape[1],imgs_data.shape[2],1)), tab_data, y
 
 #model's outer layer        
 class OSIC_outer(Layer):
@@ -406,6 +418,7 @@ def model_train(name):
     history = []
     for epoch in range(epochs):
         print("Start of epoch %d" % (epoch,))
+        epoch_start = datetime.now()
 
         # Iterate over the batches of the dataset.
         for step, x_batch_train in enumerate(train_dataset):
@@ -431,6 +444,8 @@ def model_train(name):
             print("step %d: metric = %.4f" % (step, _metric.result()))
             #history.append(_metric.result())
         model.save_weights(name+'_weights')
+        epoch_finish = datetime.now()
+        print("start =", epoch_start, ' finish = ',epoch_finish)
                 
 def model_predict():
     test_dataset = DataGenerator(original_dim,TEST_ROOT, False, sex_cat_encoder,smoking_status_cat_encoder)
