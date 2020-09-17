@@ -216,7 +216,9 @@ class DataGenerator(Sequence):
         uniques = self.dataset.Patient.unique()
         min_weeks = self.dataset.groupby('Patient')['Weeks'].min()
         for i in range(len(uniques)):
-           self.dataset.loc[self.dataset.Patient == uniques[i],'InitialWeek'] = min_weeks[i]
+            initial_fvc = self.dataset.loc[(self.dataset.Patient == uniques[i]) & (self.dataset.Weeks == min_weeks[i]),'FVC']
+            self.dataset.loc[self.dataset.Patient == uniques[i],'InitialWeek'] = min_weeks[i]
+            self.dataset.loc[self.dataset.Patient == uniques[i],'InitialFVC'] = initial_fvc.iloc[0]
         #list all patients
         self.patients = [dirname for dirname in os.listdir(path) if dirname != '.' and dirname != '..']
         self.idx = 0
@@ -224,7 +226,7 @@ class DataGenerator(Sequence):
         self.is_train = is_train
 
     def __len__(self):
-        return len(self.patients)
+        return len(self.dataset.Patient.unique())
     def _get_target(self,patient_id):
         y = self.dataset.loc[self.dataset['Patient'] == patient_id]['FVC'].to_numpy().reshape(-1,1).astype('float64')
         return y
@@ -236,7 +238,8 @@ class DataGenerator(Sequence):
         age = self.dataset.loc[self.dataset['Patient'] == patient_id]['Age'].to_numpy().reshape(-1,1)
         percent = self.dataset.loc[self.dataset['Patient'] == patient_id]['Percent'].to_numpy().reshape(-1,1)
         initial_week = self.dataset.loc[self.dataset['Patient'] == patient_id]['InitialWeek'].to_numpy().reshape(-1,1)
-        tab_data = np.concatenate([sex_np, smoking_np, weeks, age, percent, initial_week],axis=1)
+        initial_fvc = self.dataset.loc[self.dataset['Patient'] == patient_id]['InitialFVC'].to_numpy().reshape(-1,1)
+        tab_data = np.concatenate([sex_np, smoking_np, weeks, age, percent, initial_week, initial_fvc],axis=1)
         return tab_data
     
     def _prepare_image_data(self, dirname):
@@ -250,8 +253,10 @@ class DataGenerator(Sequence):
         return imgs_after_resamp
 
     def __getitem__(self,idx):
-        if idx >= len(self.patients):
-            raise StopIteration
+        if not self.is_train:
+            if self.idx >= len(self.dataset.Patient.unique()):
+                raise StopIteration
+            
         while self.patients[self.idx] in bad_ids:
             self.idx += 1
             if self.idx == len(self.patients):
@@ -274,16 +279,13 @@ class DataGenerator(Sequence):
             y = patient_id
         self.idx = self.idx + 1
         if self.is_train:
-            if self.idx == len(self.patients):
+            if self.idx == len(self.dataset.Patient.unique()):
                 self.idx = 0
-        else:
-            if self.idx == len(self.patients):
-                raise StopeIteration
         return imgs_data.reshape((imgs_data.shape[0],imgs_data.shape[1],imgs_data.shape[2],1)), tab_data, y
 
 #model's outer layer        
 class OSIC_outer(Layer):
-    def __init__(self, intermediate_dim=64, tab_dim=6, name="outer", **kwargs):
+    def __init__(self, intermediate_dim=64, tab_dim=7, name="outer", **kwargs):
         super(OSIC_outer, self).__init__(name=name, **kwargs)
         self.dense_proj = Dense(intermediate_dim+tab_dim, kernel_initializer='normal',input_shape=(1,1576))
         self.dense_out = [Dense(1,kernel_initializer='normal') for i in range(len(quantiles))]
@@ -335,7 +337,7 @@ class OSIC_Model(Model):
     def __init__(self, original_dim, intermediate_dim, name='OSIC_Model', **kwargs):
         super(OSIC_Model, self).__init__(name=name, **kwargs)
         #tab dimensions default is 5 which is all tabular features (Age, Sex, Smoking status, percent, weeks)
-        self.outer = OSIC_outer(intermediate_dim=intermediate_dim, tab_dim=6)
+        self.outer = OSIC_outer(intermediate_dim=intermediate_dim, tab_dim=7)
         self.image = OSIC_Image(original_dim, intermediate_dim=intermediate_dim)
         
     def quantile_loss(self, preds, target, total_loss, all_logits):
