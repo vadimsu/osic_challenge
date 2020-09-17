@@ -305,11 +305,11 @@ class OSIC_Image(Layer):
         super(OSIC_Image, self).__init__(name=name, **kwargs)
         self.layers = []
         self.layers.append(InputLayer(input_shape=original_dim))
-        self.layers.append(Conv2D(filters=16,kernel_size=2,padding="same", kernel_initializer=GlorotUniform(seed=0),input_shape=original_dim))
+        self.layers.append(Conv2D(filters=16,kernel_size=5,padding="same", kernel_initializer=GlorotUniform(seed=0),input_shape=original_dim))
         self.layers.append(LayerNormalization())
         ##self.layers.append(MaxPooling2D())
         #self.layers.append(Activation('relu'))
-        self.layers.append(Conv2D(filters=32,kernel_size=2,padding="same", kernel_initializer=GlorotUniform(seed=0)))
+        self.layers.append(Conv2D(filters=32,kernel_size=2,strides=2,padding="same", kernel_initializer=GlorotUniform(seed=0)))
         self.layers.append(LayerNormalization())
         ##self.layers.append(MaxPooling2D())
         #self.layers.append(Activation('relu'))
@@ -318,10 +318,11 @@ class OSIC_Image(Layer):
         #self.layers.append(Activation('relu'))
         self.layers.append(Conv2DTranspose(16, (2, 2), (1,1)))
         self.layers.append(LayerNormalization())
+        self.layers.append(Conv2D(filters=2,kernel_size=1,activation="softmax", kernel_initializer=GlorotUniform(seed=0)))
         #self.layers.append(Activation('relu'))
-        self.layers.append(Flatten())
+#        self.layers.append(Flatten())
         #self.layers.append(Dense(intermediate_dim, activation="relu"))
-        self.layers.append(Dense(intermediate_dim))
+#        self.layers.append(Dense(intermediate_dim))
 
     def call(self, inputs,training=False):
         x = inputs
@@ -414,7 +415,7 @@ def quantile_loss(preds, target):
     total_loss = []
     for i in range(preds.shape[0]):
         for q, quantile in enumerate(quantiles):
-            error = tf.subtract(target, preds[i][q])
+            error = tf.subtract(target[i], preds[i][q])
             loss = tf.reduce_mean(tf.maximum(quantile*error, (quantile-1)*error), axis=-1)
             total_loss.append(loss)
     combined_loss = tf.reduce_mean(tf.add_n(total_loss))
