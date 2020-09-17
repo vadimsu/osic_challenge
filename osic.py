@@ -212,6 +212,11 @@ class DataGenerator(Sequence):
             self.smoking_status = pd.DataFrame(self.smoking_enc.fit_transform(self.dataset.SmokingStatus.to_numpy().reshape(-1, 1)),index=self.dataset['Patient'])
         else:
             self.smoking_status = pd.DataFrame(self.smoking_enc.transform(self.dataset.SmokingStatus.to_numpy().reshape(-1, 1)),index=self.dataset['Patient'])
+        #create initial week feature
+        uniques = self.dataset.Patient.unique()
+        min_weeks = self.dataset.groupby('Patient')['Weeks'].min()
+        for i in range(len(uniques)):
+           self.dataset.loc[self.dataset.Patient == uniques[i],'InitialWeek'] = min_weeks[i]
         #list all patients
         self.patients = [dirname for dirname in os.listdir(path) if dirname != '.' and dirname != '..']
         self.idx = 0
@@ -230,9 +235,10 @@ class DataGenerator(Sequence):
         weeks = self.dataset.loc[self.dataset['Patient'] == patient_id]['Weeks'].to_numpy().reshape(-1,1)
         age = self.dataset.loc[self.dataset['Patient'] == patient_id]['Age'].to_numpy().reshape(-1,1)
         percent = self.dataset.loc[self.dataset['Patient'] == patient_id]['Percent'].to_numpy().reshape(-1,1)
-        tab_data = np.concatenate([sex_np, smoking_np, weeks, age, percent],axis=1)
+        initial_week = self.dataset.loc[self.dataset['Patient'] == patient_id]['InitialWeek'].to_numpy().reshape(-1,1)
+        tab_data = np.concatenate([sex_np, smoking_np, weeks, age, percent, initial_week],axis=1)
         return tab_data
-
+    
     def _prepare_image_data(self, dirname):
         patient,metadata = load_scan(dirname)
         patient = crop_bounding_box(patient)
@@ -244,6 +250,8 @@ class DataGenerator(Sequence):
         return imgs_after_resamp
 
     def __getitem__(self,idx):
+        if idx >= len(self.patients):
+            raise StopIteration
         while self.patients[self.idx] in bad_ids:
             self.idx += 1
             if self.idx == len(self.patients):
@@ -257,7 +265,7 @@ class DataGenerator(Sequence):
             imgs_data = self._prepare_image_data(dirname)
             if self.use_cache:
                 self.image_cache[patient_id] = imgs_data
-
+            
         #prepare tabular data
         tab_data = self._get_tab_data(patient_id)
         if self.is_train:
@@ -265,13 +273,17 @@ class DataGenerator(Sequence):
         else:
             y = patient_id
         self.idx = self.idx + 1
-        if self.idx == len(self.patients):
-            self.idx = 0
+        if self.is_train:
+            if self.idx == len(self.patients):
+                self.idx = 0
+        else:
+            if self.idx == len(self.patients):
+                raise StopeIteration
         return imgs_data.reshape((imgs_data.shape[0],imgs_data.shape[1],imgs_data.shape[2],1)), tab_data, y
 
 #model's outer layer        
 class OSIC_outer(Layer):
-    def __init__(self, intermediate_dim=64, tab_dim=5, name="outer", **kwargs):
+    def __init__(self, intermediate_dim=64, tab_dim=6, name="outer", **kwargs):
         super(OSIC_outer, self).__init__(name=name, **kwargs)
         self.dense_proj = Dense(intermediate_dim+tab_dim, kernel_initializer='normal',input_shape=(1,1576))
         self.dense_out = [Dense(1,kernel_initializer='normal') for i in range(len(quantiles))]
@@ -323,7 +335,7 @@ class OSIC_Model(Model):
     def __init__(self, original_dim, intermediate_dim, name='OSIC_Model', **kwargs):
         super(OSIC_Model, self).__init__(name=name, **kwargs)
         #tab dimensions default is 5 which is all tabular features (Age, Sex, Smoking status, percent, weeks)
-        self.outer = OSIC_outer(intermediate_dim=intermediate_dim, tab_dim=5)
+        self.outer = OSIC_outer(intermediate_dim=intermediate_dim, tab_dim=6)
         self.image = OSIC_Image(original_dim, intermediate_dim=intermediate_dim)
         
     def quantile_loss(self, preds, target, total_loss, all_logits):
@@ -342,7 +354,6 @@ class OSIC_Model(Model):
         for i in range(inputs[1].shape[0]):
             #concatenate features with tabular
             outer_input = tf.concat([image_features, tf.reshape(inputs[1][i],(1,-1))],axis=1)
-            outer_input = tf.reshape(outer_input, (-1,1))
             #feed outer layer
             logits = self.outer(outer_input,training)
             if training:
