@@ -18,12 +18,12 @@ import tensorflow as tf
 print(tf.__version__)
 from tensorflow.keras.utils import Sequence
 from tensorflow.python.keras import Model
-from tensorflow.python.keras.layers import Layer, InputLayer, Dense, Conv2D, Flatten , Conv2DTranspose, LayerNormalization
+from tensorflow.python.keras.layers import Layer, InputLayer, Dense, Conv3D, Flatten , Conv3DTranspose, LayerNormalization,MaxPooling3D
 #from tensorflow.python.keras.layers import Activation, Add, MaxPooling2D,Dropout,AveragePooling2D
 from tensorflow.python.keras.initializers import GlorotUniform
-
+from tensorflow.python.keras.layers import Activation
 from sklearn.preprocessing import OneHotEncoder
-
+print(tf.config.experimental.list_physical_devices('GPU'))
 #A dataset is here.
 #The structure is
 #train/
@@ -32,11 +32,38 @@ from sklearn.preprocessing import OneHotEncoder
 #test/
 #     test.csv
 #     DICOM folders (per patient)
-TRAIN_ROOT = #Path to your training folder
-TEST_ROOT = #Path to your testing folder
-TRAIN_DATASET_PATH = TRAIN_ROOT + '\\train.csv'
+#TRAIN_ROOT = #Path to your training folder
+#TEST_ROOT = #Path to your testing folder
+TRAIN_ROOT = '../input/osic-pulmonary-fibrosis-progression/train'
+TEST_ROOT = '../input/osic-pulmonary-fibrosis-progression/test'
+TRAIN_DATASET_PATH = TRAIN_ROOT + '.csv'
 
 tf.keras.backend.set_floatx('float64')
+
+min_scan_count = 0
+max_scan_count = 0
+def get_scan_count_min():
+    global min_scan_count
+    if min_scan_count == 0:
+        subfolders= [f.path for f in os.scandir(TRAIN_ROOT) if f.is_dir()]
+        scans_counts = []
+        for subf in subfolders:
+            scans_counts.append(len([f.path for f in os.scandir(subf) if f.is_file()]))
+        min_scan_count = int(round(np.min(scans_counts)))
+    return min_scan_count
+
+def get_scan_count_max():
+    global max_scan_count
+    if max_scan_count == 0:
+        subfolders= [f.path for f in os.scandir(TRAIN_ROOT) if f.is_dir()]
+        scans_counts = []
+        for subf in subfolders:
+            scans_counts.append(len([f.path for f in os.scandir(subf) if f.is_file()]))
+        max_scan_count = int(round(np.min(scans_counts)))
+    return max_scan_count
+
+get_scan_count_min()
+get_scan_count_max()
 
 #DICOM Scans processing routines
 cum_slice_thickness = 0
@@ -64,7 +91,12 @@ def load_scan(path):
     for s in slices:
         s.SliceThickness = slice_thickness
         
-    return np.stack([s.pixel_array for s in slices]), slices[0]
+    slices_min = 0
+    slices_max = len(slices)
+    if len(slices) > max_scan_count:
+        slices_min = int((len(slices) - max_scan_count)/2)
+        slices_max = int(len(slices) - max_scan_count)
+    return np.stack([s.pixel_array for s in slices[slices_min:slices_max]]), slices[0]
 
 def bounding_box(image):
     mid_img = image[int(image.shape[0] / 2)]
@@ -142,7 +174,8 @@ def make_lungmask(image):
     return image
 
 def normalize_and_center_image(image):
-    return (image - np.mean(image))/np.std(image)
+    #return (image - np.mean(image))/np.std(image)
+    return image/255.0
 
 def make_mesh(image, threshold=-300, step_size=1):
 
@@ -184,23 +217,33 @@ def get_scan_count_median():
     subfolders= [f.path for f in os.scandir(TRAIN_ROOT) if f.is_dir()]
     scans_counts = []
     for subf in subfolders:
-        scans_counts.append(len([f.path for f in os.scandir(os.path.join(TRAIN_ROOT,subf)) if f.is_file()]))
+        scans_counts.append(len([f.path for f in os.scandir(subf) if f.is_file()]))
     return int(round(np.median(scans_counts)))
 
 #data generator to get train/test batches
 class DataGenerator(Sequence):
     def __init__(self, original_dim, path, is_train, sex_cat_encoder, smoking_status_cat_encoder, use_cache=True):
+        super(DataGenerator,self).__init__()
         self.image_cache = {}
         self.use_cache = use_cache
         self.path = path
         if is_train:
-            self.dataset = pd.read_csv(path+'\\train.csv')
+            self.dataset = pd.read_csv(path+'.csv')
         else:
-            self.dataset = pd.read_csv(path+'\\test.csv')
+            self.dataset = pd.read_csv(path+'.csv')
+        #create initial week feature
+        uniques = self.dataset.Patient.unique()
+        min_weeks = self.dataset.groupby('Patient')['Weeks'].min()
+        for i in range(len(uniques)):
+            initial_fvc = self.dataset.loc[(self.dataset.Patient == uniques[i]) & (self.dataset.Weeks == min_weeks[i]),'FVC']
+            initial_percent = self.dataset.loc[(self.dataset.Patient == uniques[i]) & (self.dataset.Weeks == min_weeks[i]),'Percent']
+            self.dataset.loc[self.dataset.Patient == uniques[i],'InitialPercent'] = initial_percent.iloc[0]
+            self.dataset.loc[self.dataset.Patient == uniques[i],'InitialFVC'] = initial_fvc.iloc[0]
         #normalize the numeric data
         self.dataset['Age'] = (self.dataset['Age'] - self.dataset['Age'].min())/(self.dataset['Age'].max() - self.dataset['Age'].min())
         self.dataset['Weeks'] = (self.dataset['Weeks'] - self.dataset['Weeks'].min())/(self.dataset['Weeks'].max() - self.dataset['Weeks'].min())
-        self.dataset['Percent'] = (self.dataset['Percent'] - self.dataset['Percent'].min())/(self.dataset['Percent'].max() - self.dataset['Percent'].min())
+        #self.dataset['InitialPercent'] = (self.dataset['InitialPercent'] - self.dataset['InitialPercent'].min())/(self.dataset['InitialPercent'].max() - self.dataset['InitialPercent'].min())
+        #self.dataset['InitialFVC'] = (self.dataset['InitialFVC'] - self.dataset['InitialFVC'].min())/(self.dataset['InitialFVC'].max() - self.dataset['InitialFVC'].min())
         #encode categorical features
         self.sex_enc = sex_cat_encoder
         if is_train:
@@ -212,13 +255,6 @@ class DataGenerator(Sequence):
             self.smoking_status = pd.DataFrame(self.smoking_enc.fit_transform(self.dataset.SmokingStatus.to_numpy().reshape(-1, 1)),index=self.dataset['Patient'])
         else:
             self.smoking_status = pd.DataFrame(self.smoking_enc.transform(self.dataset.SmokingStatus.to_numpy().reshape(-1, 1)),index=self.dataset['Patient'])
-        #create initial week feature
-        uniques = self.dataset.Patient.unique()
-        min_weeks = self.dataset.groupby('Patient')['Weeks'].min()
-        for i in range(len(uniques)):
-            initial_fvc = self.dataset.loc[(self.dataset.Patient == uniques[i]) & (self.dataset.Weeks == min_weeks[i]),'FVC']
-            self.dataset.loc[self.dataset.Patient == uniques[i],'InitialWeek'] = min_weeks[i]
-            self.dataset.loc[self.dataset.Patient == uniques[i],'InitialFVC'] = initial_fvc.iloc[0]
         #list all patients
         self.patients = [dirname for dirname in os.listdir(path) if dirname != '.' and dirname != '..']
         self.idx = 0
@@ -235,12 +271,33 @@ class DataGenerator(Sequence):
         sex_np = self.sex.iloc[patient_tab].to_numpy()
         smoking_np = self.smoking_status.iloc[patient_tab].to_numpy()
         weeks = self.dataset.loc[self.dataset['Patient'] == patient_id]['Weeks'].to_numpy().reshape(-1,1)
+        #print('weeks ',weeks)
         age = self.dataset.loc[self.dataset['Patient'] == patient_id]['Age'].to_numpy().reshape(-1,1)
-        percent = self.dataset.loc[self.dataset['Patient'] == patient_id]['Percent'].to_numpy().reshape(-1,1)
-        initial_week = self.dataset.loc[self.dataset['Patient'] == patient_id]['InitialWeek'].to_numpy().reshape(-1,1)
+        #percent = self.dataset.loc[self.dataset['Patient'] == patient_id]['Percent'].to_numpy().reshape(-1,1)
+        initial_percent = self.dataset.loc[self.dataset['Patient'] == patient_id]['InitialPercent'].to_numpy().reshape(-1,1)
         initial_fvc = self.dataset.loc[self.dataset['Patient'] == patient_id]['InitialFVC'].to_numpy().reshape(-1,1)
-        tab_data = np.concatenate([sex_np, smoking_np, weeks, age, percent, initial_week, initial_fvc],axis=1)
+        tab_data = np.concatenate([sex_np, smoking_np, weeks, age, initial_fvc, initial_percent],axis=1)
         return tab_data
+    
+    def _get_tab_data_test(self,patient_id):
+        prev_item = None
+        for i in range(-12,134,1):
+            patient_tab = self.dataset.index[self.dataset['Patient'] == patient_id].to_list()
+            sex_np = self.sex.iloc[patient_tab].to_numpy()
+            smoking_np = self.smoking_status.iloc[patient_tab].to_numpy()
+            weeks = np.array([i]).reshape(-1,1)
+         #   print('weeks ',weeks)
+            age = self.dataset.loc[self.dataset['Patient'] == patient_id]['Age'].to_numpy().reshape(-1,1)
+            percent = self.dataset.loc[self.dataset['Patient'] == patient_id]['Percent'].to_numpy().reshape(-1,1)
+            initial_percent = self.dataset.loc[self.dataset['Patient'] == patient_id]['InitialPercent'].to_numpy().reshape(-1,1)
+            initial_fvc = self.dataset.loc[self.dataset['Patient'] == patient_id]['InitialFVC'].to_numpy().reshape(-1,1)
+            tab_data = np.concatenate([sex_np, smoking_np, weeks, age, initial_fvc, initial_percent],axis=1)
+            if prev_item is not None:
+                prev_item = np.vstack((prev_item,tab_data))
+            else:
+                prev_item = tab_data
+        #print('prev_item ',prev_item)
+        return prev_item
     
     def _prepare_image_data(self, dirname):
         patient,metadata = load_scan(dirname)
@@ -248,6 +305,15 @@ class DataGenerator(Sequence):
         imgs = get_pixels_hu(patient,metadata)
         #imgs_after_resamp, spacing = resample(imgs, metadata, [1,1,1])
         imgs_after_resamp = resize(imgs,self.image_shape,anti_aliasing = True)
+        if imgs.shape[0] > get_scan_count_max():
+            slice_count = get_scan_count_max()
+        else:
+            slice_count = imgs.shape[0]
+        imgs = resize(imgs,
+                      (slice_count, #imgs.shape[0],
+                       self.image_shape[0],
+                       self.image_shape[1],
+                       self.image_shape[2]),anti_aliasing = True)
         imgs_after_resamp = make_lungmask(imgs_after_resamp)
         imgs_after_resamp = normalize_and_center_image(imgs_after_resamp)
         return imgs_after_resamp
@@ -272,7 +338,11 @@ class DataGenerator(Sequence):
                 self.image_cache[patient_id] = imgs_data
             
         #prepare tabular data
-        tab_data = self._get_tab_data(patient_id)
+        if self.is_train:
+            tab_data = self._get_tab_data(patient_id)
+        else:
+            tab_data = self._get_tab_data_test(patient_id)
+        #print('tab_data ',tab_data)
         if self.is_train:
             y = self._get_target(patient_id)
         else:
@@ -281,17 +351,18 @@ class DataGenerator(Sequence):
         if self.is_train:
             if self.idx == len(self.dataset.Patient.unique()):
                 self.idx = 0
-        return imgs_data.reshape((imgs_data.shape[0],imgs_data.shape[1],imgs_data.shape[2],1)), tab_data, y
+        return imgs_data.reshape((imgs_data.shape[0],imgs_data.shape[1],imgs_data.shape[2],1,1)), tab_data, y, patient_id
 
 #model's outer layer        
 class OSIC_outer(Layer):
-    def __init__(self, intermediate_dim=64, tab_dim=7, name="outer", **kwargs):
+    def __init__(self, intermediate_dim=64, tab_dim=6, name="outer", **kwargs):
         super(OSIC_outer, self).__init__(name=name, **kwargs)
-        self.dense_proj = Dense(intermediate_dim+tab_dim, kernel_initializer='normal',input_shape=(1,1576))
+        self.dense_proj = Dense(intermediate_dim+tab_dim, kernel_initializer='normal')
         self.dense_out = [Dense(1,kernel_initializer='normal') for i in range(len(quantiles))]
 
     def call(self, inputs,training=False):
         x = tf.reshape(inputs, (1,-1))
+        #print('shape=',inputs.shape, 'x=',x.shape)
         x = self.dense_proj(x,training=training)
         output = [out(x,training=training) for out in self.dense_out]
         return output
@@ -305,24 +376,27 @@ class OSIC_Image(Layer):
         super(OSIC_Image, self).__init__(name=name, **kwargs)
         self.layers = []
         self.layers.append(InputLayer(input_shape=original_dim))
-        self.layers.append(Conv2D(filters=16,kernel_size=5,padding="same", kernel_initializer=GlorotUniform(seed=0),input_shape=original_dim))
+        self.layers.append(Conv3D(filters=8,kernel_size=5,strides=3,padding="same", kernel_initializer=GlorotUniform(seed=0),input_shape=original_dim))
         self.layers.append(LayerNormalization())
-        ##self.layers.append(MaxPooling2D())
-        #self.layers.append(Activation('relu'))
-        self.layers.append(Conv2D(filters=32,kernel_size=2,strides=2,padding="same", kernel_initializer=GlorotUniform(seed=0)))
+        self.layers.append(Activation('elu'))
+        self.layers.append(Conv3D(filters=16,kernel_size=2,strides=2,padding="same", kernel_initializer=GlorotUniform(seed=0)))
         self.layers.append(LayerNormalization())
-        ##self.layers.append(MaxPooling2D())
-        #self.layers.append(Activation('relu'))
-        self.layers.append(Conv2DTranspose(32, (2, 2), (1,1)))
+        self.layers.append(Activation('elu'))
+        self.layers.append(Conv3D(filters=32,kernel_size=2,strides=1,padding="same", kernel_initializer=GlorotUniform(seed=0)))
         self.layers.append(LayerNormalization())
-        #self.layers.append(Activation('relu'))
-        self.layers.append(Conv2DTranspose(16, (2, 2), (1,1)))
+        self.layers.append(Activation('elu'))
+        self.layers.append(Conv3D(filters=64,kernel_size=2,strides=1,padding="same", kernel_initializer=GlorotUniform(seed=0)))
         self.layers.append(LayerNormalization())
-        self.layers.append(Conv2D(filters=2,kernel_size=1,activation="softmax", kernel_initializer=GlorotUniform(seed=0)))
-        #self.layers.append(Activation('relu'))
-#        self.layers.append(Flatten())
-        #self.layers.append(Dense(intermediate_dim, activation="relu"))
-#        self.layers.append(Dense(intermediate_dim))
+        self.layers.append(Activation('elu'))
+#        self.layers.append(Conv3DTranspose(32, 2, 1))
+#        self.layers.append(LayerNormalization())
+#        self.layers.append(Activation('elu'))
+#        self.layers.append(Conv3DTranspose(16, 2, 1))
+#        self.layers.append(LayerNormalization())
+        #self.layers.append(Conv3D(filters=1,kernel_size=5,strides=4,kernel_initializer=GlorotUniform(seed=0)))
+#        self.layers.append(Conv3D(filters=2,kernel_size=1,activation="softmax", kernel_initializer=GlorotUniform(seed=0)))
+        self.layers.append(Dense(64))
+        self.layers.append(LayerNormalization())
 
     def call(self, inputs,training=False):
         x = inputs
@@ -338,7 +412,9 @@ class OSIC_Model(Model):
     def __init__(self, original_dim, intermediate_dim, name='OSIC_Model', **kwargs):
         super(OSIC_Model, self).__init__(name=name, **kwargs)
         #tab dimensions default is 5 which is all tabular features (Age, Sex, Smoking status, percent, weeks)
-        self.outer = OSIC_outer(intermediate_dim=intermediate_dim, tab_dim=7)
+        self.outer = OSIC_outer(intermediate_dim=intermediate_dim, tab_dim=6)
+        #self.after_image = Dense(4,kernel_initializer='normal',activation='linear')
+        #self.after_image = Dense(4,kernel_initializer='normal')
         self.image = OSIC_Image(original_dim, intermediate_dim=intermediate_dim)
         
     def quantile_loss(self, preds, target, total_loss, all_logits):
@@ -351,6 +427,7 @@ class OSIC_Model(Model):
         #feed image features layer
         image_features = self.image(inputs[0],training)
         image_features = tf.reshape(image_features, (1,-1))
+        #image_features = self.after_image(image_features)
         all_logits = []
         total_loss = []
         #iterate patient's weeks
@@ -383,13 +460,13 @@ class OSIC_Model(Model):
 #512 and 128
     
 #original_dim = (get_scan_count_median(),512,512)
-original_dim = (get_scan_count_median(),128,128)
+original_dim = (get_scan_count_median(),64,64,1)
 
 #create a model
 model = OSIC_Model(original_dim, 1)
 
 #learning rate scheduler
-initial_learning_rate = 5e-3
+initial_learning_rate = 1e-3
 #lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
 #    initial_learning_rate,
 #    decay_steps=100000,
@@ -397,9 +474,9 @@ initial_learning_rate = 5e-3
 #    staircase=True)
 lr_schedule = tf.keras.optimizers.schedules.PolynomialDecay(initial_learning_rate,20)
 #optimizer = tf.keras.optimizers.RMSprop()
-optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+#optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
 #optimizer = tf.keras.optimizers.SGD(learning_rate=1e-3)
-#optimizer = tf.keras.optimizers.Adamax()
+optimizer = tf.keras.optimizers.Adamax()
 mse_loss_fn = tf.keras.losses.MeanSquaredError()
 
 _metric = tf.keras.metrics.Mean()
@@ -421,9 +498,9 @@ def quantile_loss(preds, target):
     combined_loss = tf.reduce_mean(tf.add_n(total_loss))
     return combined_loss
 
-epochs = 5
+epochs = 100
 #uncomment to run from pre-trained, comment to run from scratch
-model.load_weights('3_conv_layers3_weights')
+model.load_weights('/kaggle/input/weights20/3_conv_layers1_weights')
 sex_cat_encoder = OneHotEncoder(sparse=False)
 smoking_status_cat_encoder = OneHotEncoder(sparse=False)
 def model_train(name):
@@ -439,11 +516,15 @@ def model_train(name):
             with tf.GradientTape() as tape:
                 #feed the model
                 logits = model(x_batch_train, training=True)
-                #print('logits ',logits)
+                print('logits ',logits)
+                print('true patient ',x_batch_train[3], x_batch_train[2])
+                print('model losses ',model.losses)
                 #get the loss
-                loss = quantile_loss(logits, x_batch_train[2]) + sum(model.losses)
-            #calculate gradients
-            grads = tape.gradient(loss, model.trainable_variables)
+                loss = quantile_loss(logits, x_batch_train[2]) + sum(model.losses) +mse_loss_fn(logits,x_batch_train[2])
+                print('loss ',loss)
+                with tape.stop_recording():
+                    #calculate gradients
+                    grads = tape.gradient(loss, model.trainable_variables)
             #apply gradients
             optimizer.apply_gradients(
                 (grad, var) 
@@ -458,6 +539,7 @@ def model_train(name):
             print("step %d: metric = %.4f" % (step, _metric.result()))
             #history.append(_metric.result())
         model.save_weights(name+'_weights')
+        tf.keras.backend.clear_session()
         epoch_finish = datetime.now()
         print("start =", epoch_start, ' finish = ',epoch_finish)
                 
@@ -468,14 +550,15 @@ def model_predict():
     fvc = []
     confidence = []
     for _, x_batch_test in enumerate(test_dataset):
-        for week in range(-12, 134, 1):
-            logits = model(x_batch_test)
-            logits = logits[0]
-            #print('logits ',logits)
-            #print('x_batch_test[2] ',x_batch_test[2])
-            weeks.append(x_batch_test[2] + '_'+ str(week))
-            fvc.append(logits[1])
-            confidence.append(logits[2] - logits[0])
+        logits = model(x_batch_test)
+        #import pdb;pdb.set_trace()
+        #logits = logits[0]
+        #print('logits ',logits)
+        #print('x_batch_test[2] ',x_batch_test[2], ' week ',' ',str(week))
+        for week in range(logits.shape[0]):
+            weeks.append(x_batch_test[2] + '_'+ str(week-12))
+            fvc.append(logits[week,1])
+            confidence.append(logits[week,2] - logits[week,0])
     predict['Patient_Week'] = weeks
     predict['FVC'] = fvc
     predict['Confidence'] = confidence
@@ -498,7 +581,7 @@ explore_dataset(TRAIN_DATASET_PATH)
 from datetime import datetime
 # current date and time
 start = datetime.now()
-model_train('3_conv_layers3')
+model_train('3_conv_layers1')
 finish = datetime.now()
 print("start =", start, ' finish = ',finish)
 model_predict()
